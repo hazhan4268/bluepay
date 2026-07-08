@@ -761,14 +761,15 @@ async function settleWithdrawal(env, chatId, adminId, withdrawalId) {
 }
 
 async function rejectWithdrawal(env, chatId, adminId, withdrawalId) {
-  const w = await env.DB.prepare(`SELECT w.*, s.telegram_id, s.title, s.balance_rial FROM withdrawals w JOIN sellers s ON s.id=w.seller_id WHERE w.id=?`).bind(withdrawalId).first();
+  const w = await env.DB.prepare(`SELECT w.*, s.telegram_id, s.title FROM withdrawals w JOIN sellers s ON s.id=w.seller_id WHERE w.id=?`).bind(withdrawalId).first();
   if (!w) return sendMessage(env, chatId, "درخواست برداشت پیدا نشد.");
   if (w.status !== "PENDING") return sendMessage(env, chatId, "این درخواست قبلاً تعیین تکلیف شده است.");
   const now = nowIso();
-  const newBalance = Number(w.balance_rial) + Number(w.amount_rial);
   const rejected = await env.DB.prepare(`UPDATE withdrawals SET status='REJECTED', rejected_at=?, admin_id=? WHERE id=? AND status='PENDING'`).bind(now, String(adminId), withdrawalId).run();
   if (!rejected.meta || Number(rejected.meta.changes || 0) < 1) return sendMessage(env, chatId, "این درخواست قبلاً تعیین تکلیف شده است.");
-  await env.DB.prepare(`UPDATE sellers SET balance_rial=?, updated_at=? WHERE id=?`).bind(newBalance, now, w.seller_id).run();
+  await env.DB.prepare(`UPDATE sellers SET balance_rial=balance_rial+?, updated_at=? WHERE id=?`).bind(Number(w.amount_rial), now, w.seller_id).run();
+  const updatedSeller = await getSellerById(env, w.seller_id);
+  const newBalance = Number(updatedSeller?.balance_rial || 0);
   await addLedger(env, w.seller_id, "WITHDRAW_REJECT", Number(w.amount_rial), newBalance, "withdrawal", String(withdrawalId), "رد درخواست برداشت و برگشت مبلغ به موجودی");
   await sendMessage(env, w.telegram_id, `❌ <b>درخواست برداشت شما رد شد</b>\n\n<b>مبلغ برگشت‌خورده به موجودی:</b>\n<code>${fmt(rialToToman(w.amount_rial))}</code> تومان\n\n<b>موجودی فعلی:</b>\n<code>${fmt(rialToToman(newBalance))}</code> تومان`);
   return sendMessage(env, chatId, "❌ برداشت رد شد و مبلغ به موجودی فروشنده برگشت.");
@@ -785,10 +786,18 @@ async function createWithdrawal(env, seller, amountRial, cardNumber, cardHolder,
   if (!held.meta || Number(held.meta.changes || 0) < 1) throw new Error("موجودی کافی نیست");
   const updatedSeller = await getSellerById(env, seller.id);
   const newBalance = Number(updatedSeller?.balance_rial || 0);
-  const result = await env.DB.prepare(`INSERT INTO withdrawals (seller_id, amount_rial, card_number, card_holder, status, created_at) VALUES (?, ?, ?, ?, 'PENDING', ?)`).bind(seller.id, amountRial, cardNumber, cardHolder, now).run();
-  const withdrawalId = result.meta.last_row_id;
-  await addLedger(env, seller.id, "WITHDRAW_HOLD", -amountRial, newBalance, "withdrawal", String(withdrawalId), ledgerDescription);
-  if (afterCreate) await afterCreate(withdrawalId, newBalance, now);
+  let withdrawalId = null;
+  try {
+    const result = await env.DB.prepare(`INSERT INTO withdrawals (seller_id, amount_rial, card_number, card_holder, status, created_at) VALUES (?, ?, ?, ?, 'PENDING', ?)`).bind(seller.id, amountRial, cardNumber, cardHolder, now).run();
+    withdrawalId = result.meta.last_row_id;
+    await addLedger(env, seller.id, "WITHDRAW_HOLD", -amountRial, newBalance, "withdrawal", String(withdrawalId), ledgerDescription);
+  } catch (err) {
+    await env.DB.prepare(`UPDATE sellers SET balance_rial=balance_rial+?, updated_at=? WHERE id=?`).bind(amountRial, nowIso(), seller.id).run();
+    throw err;
+  }
+  if (afterCreate) {
+    try { await afterCreate(withdrawalId, newBalance, now); } catch (err) { console.error("Withdrawal post-create notification failed:", err); }
+  }
   return { withdrawalId, newBalance, createdAt: now };
 }
 
