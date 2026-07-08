@@ -754,7 +754,8 @@ async function settleWithdrawal(env, chatId, adminId, withdrawalId) {
   if (!w) return sendMessage(env, chatId, "درخواست برداشت پیدا نشد.");
   if (w.status !== "PENDING") return sendMessage(env, chatId, "این درخواست قبلاً تعیین تکلیف شده است.");
   const now = nowIso();
-  await env.DB.prepare(`UPDATE withdrawals SET status='SETTLED', settled_at=?, admin_id=? WHERE id=? AND status='PENDING'`).bind(now, String(adminId), withdrawalId).run();
+  const settled = await env.DB.prepare(`UPDATE withdrawals SET status='SETTLED', settled_at=?, admin_id=? WHERE id=? AND status='PENDING'`).bind(now, String(adminId), withdrawalId).run();
+  if (!settled.meta || Number(settled.meta.changes || 0) < 1) return sendMessage(env, chatId, "این درخواست قبلاً تعیین تکلیف شده است.");
   await sendMessage(env, w.telegram_id, `✅ <b>درخواست برداشت شما تسویه شد</b>\n\n<b>مبلغ:</b>\n<code>${fmt(rialToToman(w.amount_rial))}</code> تومان\n\n<b>شماره کارت:</b>\n<code>${esc(w.card_number)}</code>\n\n<b>زمان:</b>\n${now}`);
   return sendMessage(env, chatId, "✅ برداشت تسویه شد.");
 }
@@ -765,7 +766,8 @@ async function rejectWithdrawal(env, chatId, adminId, withdrawalId) {
   if (w.status !== "PENDING") return sendMessage(env, chatId, "این درخواست قبلاً تعیین تکلیف شده است.");
   const now = nowIso();
   const newBalance = Number(w.balance_rial) + Number(w.amount_rial);
-  await env.DB.prepare(`UPDATE withdrawals SET status='REJECTED', rejected_at=?, admin_id=? WHERE id=? AND status='PENDING'`).bind(now, String(adminId), withdrawalId).run();
+  const rejected = await env.DB.prepare(`UPDATE withdrawals SET status='REJECTED', rejected_at=?, admin_id=? WHERE id=? AND status='PENDING'`).bind(now, String(adminId), withdrawalId).run();
+  if (!rejected.meta || Number(rejected.meta.changes || 0) < 1) return sendMessage(env, chatId, "این درخواست قبلاً تعیین تکلیف شده است.");
   await env.DB.prepare(`UPDATE sellers SET balance_rial=?, updated_at=? WHERE id=?`).bind(newBalance, now, w.seller_id).run();
   await addLedger(env, w.seller_id, "WITHDRAW_REJECT", Number(w.amount_rial), newBalance, "withdrawal", String(withdrawalId), "رد درخواست برداشت و برگشت مبلغ به موجودی");
   await sendMessage(env, w.telegram_id, `❌ <b>درخواست برداشت شما رد شد</b>\n\n<b>مبلغ برگشت‌خورده به موجودی:</b>\n<code>${fmt(rialToToman(w.amount_rial))}</code> تومان\n\n<b>موجودی فعلی:</b>\n<code>${fmt(rialToToman(newBalance))}</code> تومان`);
@@ -773,12 +775,16 @@ async function rejectWithdrawal(env, chatId, adminId, withdrawalId) {
 }
 
 async function createWithdrawal(env, seller, amountRial, cardNumber, cardHolder, ledgerDescription, afterCreate) {
+  amountRial = Number(amountRial);
+  if (!Number.isFinite(amountRial) || amountRial < 1) throw new Error("مبلغ برداشت معتبر نیست");
   if (amountRial > Number(seller.balance_rial)) throw new Error("موجودی کافی نیست");
   if (String(cardNumber).length !== 16) throw new Error("شماره کارت باید 16 رقم باشد");
   if (String(cardHolder || "").trim().length < 2) throw new Error("نام صاحب کارت را وارد کن");
   const now = nowIso();
-  const newBalance = Number(seller.balance_rial) - Number(amountRial);
-  await env.DB.prepare(`UPDATE sellers SET balance_rial=?, updated_at=? WHERE id=?`).bind(newBalance, now, seller.id).run();
+  const held = await env.DB.prepare(`UPDATE sellers SET balance_rial=balance_rial-?, updated_at=? WHERE id=? AND balance_rial>=?`).bind(amountRial, now, seller.id, amountRial).run();
+  if (!held.meta || Number(held.meta.changes || 0) < 1) throw new Error("موجودی کافی نیست");
+  const updatedSeller = await getSellerById(env, seller.id);
+  const newBalance = Number(updatedSeller?.balance_rial || 0);
   const result = await env.DB.prepare(`INSERT INTO withdrawals (seller_id, amount_rial, card_number, card_holder, status, created_at) VALUES (?, ?, ?, ?, 'PENDING', ?)`).bind(seller.id, amountRial, cardNumber, cardHolder, now).run();
   const withdrawalId = result.meta.last_row_id;
   await addLedger(env, seller.id, "WITHDRAW_HOLD", -amountRial, newBalance, "withdrawal", String(withdrawalId), ledgerDescription);
